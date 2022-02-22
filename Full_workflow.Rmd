@@ -1,0 +1,587 @@
+---
+title: "Japan Sea SAS detection"
+author: "Andrius J. Dagilis"
+date: "2/21/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(cowplot)
+library(reshape2)
+library(wesanderson)
+library(BEDASSLE)
+library(qvalue)
+
+#Set to your working directory
+wd = "D:/DATA/Stickles/RePhase/"
+knitr::opts_knit$set(root.dir = wd)
+```
+
+## Phasing VCFs
+
+We first phase VCFs. R will ignore the headers if desired, but I prefer to strip the header first (keep copies!).
+
+```{r phasing (Equivalent to https://github.com/JasonSardell/BlackspottedStickleback/blob/master/phasescript.crosses.R)}
+
+#First read iun a pedigree, three lines per row, with each row having the offspring and then father and mother, tab separated.
+
+pedigree = read.table("pedigrees1",header=FALSE,sep="\t",stringsAsFactors = FALSE)
+
+#Quick function to convert from vcf genotype to 0,1,2
+procfunc = function(x) {
+  t1 = sub(":.*","",x)
+  if(t1 == "0/0") return(0)
+  else if(t1 == "0/1" | t1 == "1/0") return(1)
+  else if(t1 == "1/1") return(2)
+  else return(-1)
+}
+
+
+#Phasing function for a chromosome
+phase = function(chr){
+  filename = paste(chr,".minQ999.minGQ20.mindepth10.maxdepth38.625.recode.vcf",sep="")
+  
+  #Read in header stripped VCF and a pedigree file where each family is a line, first column is offspring, next column is father, next column is mother
+  vcf_total = read.table(filename,header=TRUE,sep="\t",stringsAsFactors = FALSE)
+  vcf_total = vcf_total[complete.cases(vcf_total),]
+  pos = vcf_total$POS
+  geno = data.frame(apply(vcf_total[,10:length(vcf_total[1,])],1:2,procfunc),stringsAsFactors = FALSE)
+  names(geno) = names(vcf_total[,10:length(vcf_total[1,])])
+  
+  phasedData = phaseAll(geno,pedigree)
+  phasedData$POS = pos
+  #Save phasing results
+  out1 = paste("phasedOffspring",chr,".txt",sep="")
+  write.table(phasedData,file=out1,append=FALSE,quote=FALSE,sep="\t",row.names=FALSE)
+  vcf_out = vcf_total[,1:9]
+  vcf_out[,10:39] = phasedData[,1:30]
+  vcf_out$INFO = "."
+  vcf_out$FORMAT = "GT"
+  out2 = paste("hapX",chr,".vcf",sep="")
+  write.table(vcf_out,file=out2,append=FALSE,quote=FALSE,sep="\t",row.names=FALSE)
+  
+}
+
+#Taking a genotype and pedigree and returning the phased haplotypes
+#Returns vector that's formatted for VCF
+phaseAll = function(geno,pedigree){
+  numOffspring = length(pedigree[,1])
+  nSites = dim(geno)[1]
+  ret = matrix(nrow=nSites,ncol=numOffspring)
+  for(i in 1:numOffspring){
+    #IDs for individuals in the cross
+    mID = which(names(geno)==pedigree[i,3])
+    fID = which(names(geno)==pedigree[i,2])
+    oID = which(names(geno)==pedigree[i,1])
+    ret[,i] = sapply(1:nSites,function(x) phasefunc(geno[x,oID],geno[x,mID],geno[x,fID]))
+  }
+  ret = data.frame(ret,stringsAsFactors = FALSE)
+  names(ret) = names(geno[,match(pedigree[,1],names(geno))])
+  return(data.frame(ret))
+}
+
+#Phasing function for a site, takes o,m,f
+# o -offspring geno
+# m -mother's geno
+# f -father's geno
+phasefunc = function(o,m,f){
+  #First two cases have unambiguous phasing unless there's a denovo mutation (in which case we exclude the site)
+  o = unlist(o)
+  m = unlist(m)
+  f = unlist(f)
+  if(m == -1 & f == -1) return(".|.")
+  else if(o == -1) return(".|.")
+  #else if(o == -1 & (m == 2 & f ==0)) return("1|0")
+  #else if(o == -1 & (f == 2 & m ==0)) return("0|1")
+  else if(o == 0 & ((m<2 & f<2) & (m!= -1 & f!= -1))) return("0|0")
+  else if(o == 2 & ((m>0 & f>0) & (m!= -1 & f!= -1))) return("1|1")
+  else {
+    #Ambiguous phasing if both parents heterozygous
+    if(o==1 & (m==1 & f ==1)) return("0/1")
+    #Paternally inherited 1
+    else if(o==1 & ((m==0 & (f==2 | f==1)))) return("0|1")
+    #Maternally inherited 1
+    else if(o==1 & ((f==0 & (m==2 | m==1)))) return("1|0")
+    #Paternally inherited 0
+    else if(o==1 & ((f==1 & m==2))) return("1|0")
+    #Maternally inherited 0
+    else if(o==1 & ((f==2 & m==1))) return("0|1")
+    #Denovo mutation: returns .|.
+    else return(".|.")
+  }
+}
+
+chroms = c("chrI","chrII","chrIII","chrIV","chrV","chrVI","chrVII","chrVIII","chrX",
+           "chrXI","chrXII","chrXIII","chrXIV","chrXV","chrXVI","chrXVII","chrXVIII","chrXX","chrXXI")
+
+for(c in chroms) phase(c)
+
+```
+
+## Calculating pop gen statistics
+
+After the above step, should have phased vcfs formatted for ease of use in the analysis (missing headers!).
+
+
+```{r Calculating pop-gen stats}
+
+
+allelePat = function(x) as.numeric(sub("\\d\\|","",x))
+alleleMat = function(x) as.numeric(sub("\\|\\d","",x))
+
+#Custom function to calculate Tajima's D for haplotypes x, with s samples, and over a window of size n.
+tajiD = function(x,s,n){
+  pi_x = 0
+  if(is.null(x)) return(NA)
+  for(i in 1:(n-1)){
+    for(j in (i+1):n) {
+      tryCatch({
+        pi_x = pi_x+ sum(abs(x[,i]-x[,j]),na.rm=TRUE)
+      }, error = function(e){
+        pi_x = pi_x + sum(abs(x[i]-x[j]),na.rm=TRUE) 
+      })
+    }
+  }
+  pi_x = 2*pi_x/(n*(n-1))
+  S = s
+  a1 = sum(1/(1:(n-1)))
+  a2 = sum(1/(1:(n-1))^2)
+  b1 = (n+1)/(3*(n-1))
+  b2 = (2*(n*n+n+3))/(9*n*(n-1))
+  c1 = b1-1/a1
+  c2 = b2-(n+2)/(a1*n)+a2/(a1^2)
+  e1 = c1/a1
+  e2 = c2/(a1^2+a2)
+  ret = (pi_x-S/a1)/(sqrt(e1*S+e2*S*(S-1)))
+  return(ret)
+}
+
+#Function which takes a chromosome, number of missing phased haplotypes allowed per site, and size of window. Outputs a data frame of population genetic statistics calculated in the windows listed.
+calcStats = function(c,n=5,wnd=10000){
+  phName = paste("phasedOffspring",c,".txt",sep="")
+  phasedData= read.table(phName,header=TRUE,stringsAsFactors = FALSE,sep="\t")
+  
+  #Filter out sites with more than n missing phased offspring
+  missingData = apply(phasedData,1,function(x) length(c(grep("\\.",x),grep("/",x))))
+  idx = which(missingData<n)
+  phasedData = phasedData[idx,]
+  pos =phasedData$POS
+  
+  
+  sons = grep("M",names(phasedData))
+  daughters = setdiff(1:(length(phasedData[1,])-1),sons)  
+  #Separate haplotypes
+  hapsY = apply(phasedData[,sons],1:2,allelePat) #On the Y
+  hapsX = apply(phasedData[,daughters],1:2,allelePat) #On the X
+  hapsTSs = apply(phasedData[,sons],1:2,alleleMat) #Among threespine sequences in sons (so Xs)
+  hapsTSd = apply(phasedData[,daughters],1:2,alleleMat) #And threespine sequences in daughters (also Xs)
+  hapsT = cbind(hapsX,hapsY) #Total Japan Sea
+  hapsT2 = cbind(hapsTSs,hapsTSd) #Total among Threespine
+  #hapsT3 = cbind(hapsT,hapsT2) #All haplotypes
+  #hapsT4 = cbind(hapsX,hapsT2) #All Xs
+
+  
+  #Missing Data
+  miss_X = apply(hapsX,1,function(x) length(which(!is.finite(x))))
+  miss_Y= apply(hapsY,1,function(x) length(which(!is.finite(x))))
+  miss_tss= apply(hapsTSs,1,function(x) length(which(!is.finite(x))))
+  miss_tsd= apply(hapsTSd,1,function(x) length(which(!is.finite(x))))
+  miss_t = miss_X+miss_Y
+  miss_t2 = miss_tss+miss_tsd
+  #miss_t4 = miss_t2+miss_X
+
+  #Calculate alternate allele frequencies
+  p_y= apply(hapsY,1,mean,na.rm=TRUE)
+  p_x= apply(hapsX,1,mean,na.rm=TRUE)
+  p_tsd= apply(hapsTSd,1,mean,na.rm=TRUE)
+  p_tss= apply(hapsTSs,1,mean,na.rm=TRUE)
+  p_t = apply(hapsT,1,mean,na.rm=TRUE)
+  p_t2 = apply(hapsT2,1,mean,na.rm=TRUE)
+  #p_t3 = apply(hapsT3,1,mean,na.rm=TRUE)
+  #p_t4 = apply(hapsT4,1,mean,na.rm=TRUE)
+
+  
+  #Calculate pi
+  pi_y = 2*p_y*(1-p_y)*(dim(hapsY)[2]-miss_Y)/(dim(hapsY)[2]-miss_Y-1)
+  pi_x = 2*p_x*(1-p_x)*(dim(hapsX)[2]-miss_X)/(dim(hapsX)[2]-miss_X-1)
+  pi_tss = 2*p_tss*(1-p_tss)*(dim(hapsY)[2]-miss_Y)/(dim(hapsY)[2]-miss_Y-1)
+  pi_tsd = 2*p_tsd*(1-p_tsd)*(dim(hapsY)[2]-miss_X)/(dim(hapsY)[2]-miss_X-1)
+  pi_t = 2*p_t*(1-p_t)*(dim(hapsT)[2]-miss_t)/(dim(hapsT)[2]-miss_t-1)
+  pi_t2 = 2*p_t2*(1-p_t2)*(dim(hapsT)[2]-miss_Y-miss_X)/(dim(hapsT)[2]-miss_Y-miss_X-1)
+  #pi_t3 = 2*p_t3*(1-p_t3)*(dim(hapsT3)[2]-2*miss_Y-2*miss_X)/(dim(hapsT3)[2]-2*miss_Y-2*miss_X-1)
+  #pi_t4 = 2*p_t4*(1-p_t4)*(dim(hapsT4)[2]-miss_t4)/(dim(hapsT4)[2]-miss_t4-1)
+ 
+  #Manual Slatkin Fst estimator calculation
+  fst = 1-(((length(daughters)-miss_X)/((length(daughters)+length(sons))-miss_X-miss_Y)*pi_x+(length(sons)-miss_Y)/((length(daughters)+length(sons))-miss_X-miss_Y)*pi_y))/pi_t
+  allele.counts = matrix(nrow=2,data = c(apply(hapsX,1,sum,na.rm=TRUE),apply(hapsY,1,sum,na.rm=TRUE)),byrow=TRUE)
+  sample.size = matrix(nrow=2,data=c(15-miss_X,15-miss_Y),byrow=TRUE)
+  
+  #And Fst using BEDASSLE
+  fst2 = calculate.pairwise.Fst(allele.counts,sample.size)
+  
+  #By convention, set Fst<0 to 0.
+  fst[which(fst<0)]=0
+
+  #Dxy between X and Y
+  dxy = p_x*(1-p_y)+p_y*(1-p_x)
+  #Dxy between Japan Sea and Threespine
+  dxy_jsts = p_t*(1-p_t2)+p_t2*(1-p_t)
+  #Dxy between Threespine and the Y
+  #dxy_yts = p_y*(1-p_t2)+p_t2*(1-p_y)
+  
+  #Number of snps
+  snp_y = which(pi_y!=0)
+  snp_x = which(pi_x!=0)
+  snp_tss = which(pi_tss!=0)
+  snp_tsd = which(pi_tsd!=0)
+  snp_t = which(pi_t!=0)
+  snp_t2 = which(pi_t2!=0)
+  
+  start = 1
+  #change step if you don't want overlapping windows
+  step = wnd
+  dens_y = c()
+  dens_x = c()
+  dens_tss = c()
+  dens_tsd = c()
+  dens_t = c()
+  pir_x = c()
+  pir_y = c()
+  pir_t = c()
+  pir_tss = c()
+  pir_tsd = c()
+  dxy_r = c()
+  dxy_r2 = c()
+  fst_r = c()
+  fst_r2 = c()
+  tajiX = c()
+  tajiY = c()
+  tajiT = c()
+  tajiT2 = c()
+  idx2 = c()
+  while(start < max(pos)){
+    end = start+wnd
+    idx = which(pos %in% start:end)
+    wnd2 = wnd-length(idx2)
+    dens_y = c(dens_y,length(intersect(snp_y,idx)))
+    dens_x = c(dens_x,length(intersect(snp_x,idx)))
+    dens_tss = c(dens_tss,length(intersect(snp_tss,idx)))
+    dens_tsd = c(dens_tsd,length(intersect(snp_tsd,idx)))
+    dens_t = c(dens_t,length(intersect(snp_t,idx)))
+    pir_x = c(pir_x,sum(pi_x[idx])/wnd2)
+    pir_y = c(pir_y,sum(pi_y[idx])/wnd2)
+    pir_t = c(pir_t,sum(pi_t[idx])/wnd2)
+    pir_tss = c(pir_tss,sum(pi_tss[idx])/wnd2)
+    pir_tsd = c(pir_tsd,sum(pi_tsd[idx])/wnd2)
+    fst_r = c(fst_r,mean(fst[intersect(snp_t,idx)],na.rm=TRUE))
+    fst2 = fstFunc(allele.counts,sample.size,idx)
+    fst_r2 = c(fst_r2,fst2)
+    dxy_r = c(dxy_r,sum(dxy[idx],na.rm=TRUE)/wnd2)
+    dxy_r2 = c(dxy_r2,sum(dxy_jsts[idx],na.rm=TRUE)/wnd2)
+    tajiX = c(tajiX,tajiD(hapsX[idx,],length(intersect(snp_x,idx)),15))
+    tajiY = c(tajiY,tajiD(hapsY[idx,],length(intersect(snp_y,idx)),15))
+    tajiT = c(tajiT,tajiD(hapsT[idx,],length(intersect(snp_t,idx)),30))
+    tajiT2 = c(tajiT2,tajiD(hapsT2[idx,],length(intersect(snp_tss,idx)),30))
+    start = start + step
+  }
+  chr = data.frame(dxy=dxy_r,dx=dens_x,dy=dens_y,dt=dens_t,piy=pir_y,
+                   pix=pir_x,pit=pir_t,fst=fst_r,fst2=fst_r2,dtss=dens_tss,dtsd=dens_tsd,
+                   tajx = tajiX,tajy=tajiY,tajjs=tajiT,tajts=tajiT2,dxy2=dxy_r2)
+  chr[which(chr$dt==0),] = NA
+  chr$pos = 1:length(chr$dx)*wnd
+  fout = paste(c,".df.RData",sep="")
+  save(chr,file=fout)
+}
+
+for(c in chroms) {calcStats(c,n=5,wnd=10000)}
+
+```
+
+## Plotting sex chromosome stats
+
+The above code should generate R dataframes per chromosome, calculating all of the relevant population genetic statistics. We next analyze the sex chromosomes in particular. We next summarize the autosomes to give a baseline, and prepare data-frames for the sex chromosomes in particular.
+
+```{r Comparing to Sex Chromosomes}
+
+#summary of stats for all autosomes
+tajiAuto = c()
+piAuto = c()
+tajiTSAuto = c()
+dtAuto = c()
+fstAuto = c()
+fst2Auto = c()
+for(c in setdiff(chroms,c("chrIX","chrXIX"))){
+  fin = paste(c,".df.RData",sep="")
+  load(fin)
+  tajiAuto = c(tajiAuto,chr$tajjs)
+  tajiTSAuto = c(tajiTSAuto,chr$tajts)
+  piAuto = c(piAuto,chr$pit)
+  dtAuto = c(dtAuto,chr$dt)
+  fstAuto=c(fstAuto,chr$fst)
+  fst2Auto=c(fst2Auto,chr$fst2)
+}
+
+#Loading in the sex chromosomes
+load("chrXIX.df.RData")
+chrXIX =chr
+load("chrIX.df.RData")
+chrIX = chr
+rm(chr)
+
+chrIX$pos = chrIX$pos+max(chrXIX$pos,na.rm=TRUE)
+chr_tot = rbind(chrXIX,chrIX)
+
+chr_tot$stratum=NA
+chr_tot$stratum[which(chr_tot$pos %in% 0:2500000)] = "P1"
+chr_tot$stratum[which(chr_tot$pos %in% 2500000:6890000)] = "S2"
+chr_tot$stratum[which(chr_tot$pos %in% 6890000:12500000)] = "S3"
+chr_tot$stratum[which(chr_tot$pos %in% 12500000:20620000)] = "S1"
+chr_tot$stratum[which(chr_tot$pos %in% 20620000:27520000)] = "S4"
+chr_tot$stratum[which(chr_tot$pos > 27520000)] = "P2"
+chr_tot$stratum = factor(chr_tot$stratum,levels=c("P1","S2","S3","S1","S4","P2"))
+
+
+
+piPlot = ggplot(chr_tot,aes(x=pos))+
+  geom_point(aes(y=piy),col="darkorange",alpha=0.5,size=0.75)+
+  geom_point(aes(y=pix),col="deepskyblue",alpha=0.5,size=0.75)+
+  geom_hline(yintercept=mean(piAuto,na.rm=TRUE),col="grey50",linetype="longdash")+
+  geom_smooth(data=subset(chr_tot,pos<2500000),aes(x=pos,y=piy),span=0.2,col="darkorange",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 2500000:6890000),aes(x=pos,y=piy),span=0.2,col="darkorange",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 6890000:12500000),aes(x=pos,y=piy),span=0.2,col="darkorange",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 12500000:20620000),aes(x=pos,y=piy),span=0.2,col="darkorange",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 20620000:27520000),aes(x=pos,y=piy),span=0.2,col="darkorange",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 27520000:41000000),aes(x=pos,y=piy),span=0.2,col="darkorange",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos<2500000),aes(x=pos,y=pix),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 2500000:6890000),aes(x=pos,y=pix),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 6890000:12500000),aes(x=pos,y=pix),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 12500000:20620000),aes(x=pos,y=pix),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 20620000:27520000),aes(x=pos,y=pix),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 27520000:41000000),aes(x=pos,y=pix),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+  coord_cartesian(ylim=c(0,0.0015),expand = FALSE)+labs(y="pi")
+
+  geom_vline(xintercept = c(2500000,6890000,12500000,20620000,27520000))
+
+
+tajPlot = ggplot(chr_tot,aes(x=pos))+
+  geom_point(aes(y=tajy),col="darkorange",alpha=0.5,size=0.75)+
+  geom_point(aes(y=tajx),col="deepskyblue",alpha=0.5,size=0.75)+
+  geom_hline(yintercept=mean(tajiAuto,na.rm=TRUE),col="grey50",linetype="longdash")+
+  geom_smooth(data=subset(chr_tot,pos<2500000),aes(x=pos,y=tajy),span=0.2,col="darkorange",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 2500000:6890000),aes(x=pos,y=tajy),span=0.2,col="darkorange",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 6890000:12500000),aes(x=pos,y=tajy),span=0.2,col="darkorange",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 12500000:20620000),aes(x=pos,y=tajy),span=0.4,col="darkorange",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 20620000:27520000),aes(x=pos,y=tajy),span=0.2,col="darkorange",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 27520000:41000000),aes(x=pos,y=tajy),span=0.2,col="darkorange",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos<2500000),aes(x=pos,y=tajx),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 2500000:6890000),aes(x=pos,y=tajx),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 6890000:12500000),aes(x=pos,y=tajx),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 12500000:20620000),aes(x=pos,y=tajx),span=0.4,col="deepskyblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 20620000:27520000),aes(x=pos,y=tajx),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 27520000:41000000),aes(x=pos,y=tajx),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+  coord_cartesian(ylim=c(-2.6,1.5),expand = FALSE)
+
+
+
+fstPlot = ggplot(chr_tot,aes(x=pos,y=fst))+
+  geom_hline(yintercept=mean(fstAuto[is.finite(fstAuto)],na.rm=TRUE),col="grey50",linetype="longdash")+
+  geom_point(col="darkblue",alpha=0.5,size=0.75)+
+  geom_smooth(data=subset(chr_tot,pos<2500000),aes(x=pos,y=fst),span=0.2,col="darkblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 2500000:6890000),aes(x=pos,y=fst),span=0.2,col="darkblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 6890000:12500000),aes(x=pos,y=fst),span=0.2,col="darkblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 12500000:20620000),aes(x=pos,y=fst),span=0.4,col="darkblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 20620000:27530000),aes(x=pos,y=fst),span=0.2,col="darkblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 27530000:41000000),aes(x=pos,y=fst),span=0.2,col="darkblue",fill=NA,size=1.5)+
+  coord_cartesian(ylim=c(-0.1,1.1),expand=FALSE)
+
+dxyPlot = ggplot(chr_tot,aes(x=pos))+
+  stat_summary_bin(aes(y=dxy),bins=413,col="darkblue",size=0.25)+
+  stat_summary_bin(aes(y=dxy2),bins=413,col="red",size=0.25)+
+  geom_smooth(data=subset(chr_tot,pos<2500000),aes(x=pos,y=dxy),span=0.2,col="darkblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 2500000:12500000),aes(x=pos,y=dxy),span=0.2,col="darkblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 12500000:20620000),aes(x=pos,y=dxy),span=0.4,col="darkblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 20620000:27530000),aes(x=pos,y=dxy),span=0.2,col="darkblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 27530000:41000000),aes(x=pos,y=dxy),span=0.2,col="darkblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos<2500000),aes(x=pos,y=dxy2),span=0.2,col="red",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 2500000:12500000),aes(x=pos,y=dxy2),span=0.2,col="red",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 12500000:20620000),aes(x=pos,y=dxy2),span=0.4,col="red",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 20620000:27530000),aes(x=pos,y=dxy2),span=0.2,col="red",fill=NA,size=1.5)+
+  geom_smooth(data=subset(chr_tot,pos %in% 27530000:41000000),aes(x=pos,y=dxy2),span=0.2,col="red",fill=NA,size=1.5)+
+  coord_cartesian(ylim=c(0,0.01),expand = FALSE)
+
+
+
+
+#Dealing with depth - since the files are rather huge we process depth outside of R, ideally. In short - calculate depth ratios between sons and daughters using depth output from samtools depth, and processing it with awk. Generate a large data table with per window depth for sons, daughters, and read depth ratio.
+  
+read.table("depths.tsv", header = TRUE)
+
+depthPlot= ggplot(depth,aes(x=pos))+
+    stat_summary_bin(aes(y=daughters),bins=413,col="deepskyblue",alpha=0.5,size=0.25)+
+    stat_summary_bin(aes(y=sons),bins=413,col="darkorange",alpha=0.5,size=0.25)+
+    geom_smooth(data=subset(depth,pos %in% 1:2500000),aes(x=pos,y=sons),span=0.2,col="darkorange",fill=NA,size=1.5)+
+    geom_smooth(data=subset(depth,pos %in% 2500000:6890000),aes(x=pos,y=sons),span=0.2,col="darkorange",fill=NA,size=1.5)+
+    geom_smooth(data=subset(depth,pos %in% 6890000:12500000),aes(x=pos,y=sons),span=0.2,col="darkorange",fill=NA,size=1.5)+
+    geom_smooth(data=subset(depth,pos %in% 12500000:20620000),aes(x=pos,y=sons),span=0.2,col="darkorange",fill=NA,size=1.5)+
+    geom_smooth(data=subset(depth,pos %in% 20620000:27530000),aes(x=pos,y=sons),span=0.2,col="darkorange",fill=NA,size=1.5)+
+    geom_smooth(data=subset(depth,pos %in% 27530000:41000000),aes(x=pos,y=sons),span=0.2,col="darkorange",fill=NA,size=1.5)+
+    geom_smooth(data=subset(depth,pos %in% 1:2500000),aes(x=pos,y=daughters),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+    geom_smooth(data=subset(depth,pos %in% 2500000:6890000),aes(x=pos,y=daughters),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+    geom_smooth(data=subset(depth,pos %in% 6890000:12500000),aes(x=pos,y=daughters),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+    geom_smooth(data=subset(depth,pos %in% 12500000:20620000),aes(x=pos,y=daughters),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+    geom_smooth(data=subset(depth,pos %in% 20620000:27530000),aes(x=pos,y=daughters),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+    geom_smooth(data=subset(depth,pos %in% 27530000:41000000),aes(x=pos,y=daughters),span=0.2,col="deepskyblue",fill=NA,size=1.5)+
+    scale_y_continuous(trans="log10",limits = c(10,50))
+
+
+depthPlot2 = ggplot(depth,aes(x=pos,y=ratio))+
+  geom_hline(yintercept=1,col="grey50",linetype="longdash")+
+  stat_summary_bin(aes(y=sons/daughters),bins=4130,col="darkblue",alpha=0.25,size=0.125)+
+  geom_smooth(data=subset(depth,pos %in% 1:2500000),aes(x=pos,y=sons/daughters),span=0.2,col="darkblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(depth,pos %in% 2500000:6890000),aes(x=pos,y=sons/daughters),span=0.2,col="darkblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(depth,pos %in% 6890000:12500000),aes(x=pos,y=sons/daughters),span=0.2,col="darkblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(depth,pos %in% 12500000:20620000),aes(x=pos,y=sons/daughters),span=0.2,col="darkblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(depth,pos %in% 20620000:27520000),aes(x=pos,y=sons/daughters),span=0.2,col="darkblue",fill=NA,size=1.5)+
+  geom_smooth(data=subset(depth,pos %in% 27520000:41000000),aes(x=pos,y=sons/daughters),span=0.2,col="darkblue",fill=NA,size=1.5)+
+  scale_y_continuous(lim=c(0.4,2.1),trans="log2")+coord_cartesian(expand=FALSE)
+
+
+
+#Finally, we can reproduce figure 1 with:
+
+plot_grid(depthPlot2,piPlot,tajPlot,dxyPlot,rows=4,align=TRUE)
+
+
+```
+
+## XY consistency
+
+We next look to validate where the end of the neo-sex chromosome SDR is. We do this with gene tree consistency analysis. The code is largely the same as: https://github.com/JasonSardell/BlackspottedStickleback/blob/master/XYconsistency.R
+
+
+```{r XY consistency}
+
+tree = read.tree("treeResults.txt")
+
+n = length(tree)
+#Drop the Threespine sequences, not necessary
+for(i in 1:n){
+  names = tree[[i]]$tip.label
+  drop = grep("_A",names)
+  tree[[i]] = drop.tip(tree[[i]],drop)
+}
+#Drop the empty nodes that result.
+ditree = multi2di.multiPhylo(tree,random=FALSE)
+#Coloring function for the tips. Way better ways to do this.
+colfunc = function(x){
+  idx_M = grep("M",x)
+  cols = rep("red",30)
+  cols[idx_M] = "blue"
+  return(cols)
+}
+#The full sample names are hard to look at, let's simplify.
+fasterNames = c("1F1","1F2","1F3","1F4","1F5","1F6","1F7","1F8","2F1","2F2","2F3","2F4","2F5","2F6","2F7",
+                "1M1","1M2","1M3","1M4","1M5","1M6","1M7","1M8","2M1","2M2","2M3","2M4","2M5","2M6","2M7")
+noms = c("my1x2F1F_B","my1x6F1F_B","my2x4F1F_B","my2x7F1F_B","my3x1F1F_B","my3x3F1F_B","my3x5F1F_B","my4x9F1F_B",
+         "X1_4F.sorted.bam_B","X2_4F.sorted.bam_B","X3_4F.sorted.bam_B","X4_8F.sorted.bam_B","X5_5F.sorted.bam_B","X6_4F.sorted.bam_B","X7_4F.sorted.bam_B",
+         "my1x2F1M_B","my1x6F1M_B","my3x1F1M_B","my2x4F1M_B","my2x7F1M_B","my3x3F1M_B","my3x5F1M_B","my4x9F1M_B",
+         "X1_5M.sorted.bam_B","X2_5M.sorted.bam_B","X3_5M.sorted.bam_B","X4_4M.sorted.bam_B","X5_1M.sorted.bam_B","X6_5M.sorted.bam_B","X7_3M.sorted.bam_B")
+for(i in 1:n){
+  names = ditree[[i]]$tip.label
+  idx = match(names,noms)
+  ditree[[i]]$tip.label = fasterNames[idx]
+}
+#Loop through and take a glance at the trees.
+for(i in 1:n){
+  plot.phylo(ditree[[i]], tip.color = colfunc(ditree[[i]]$tip.label))
+}
+
+#Function which calculates the largest monophyletic group of males
+nMale = function(x){
+  top = 1
+  for(i in 1:x$Nnode){
+    d = x$tip.label[getDescendants(x,(i+28))]
+    d = d[!is.na(d)]
+    ns = grep("M",d)
+    if(length(ns)==length(d) & length(ns) > top) top = length(ns)
+  }
+  return(top)
+}
+
+xy_consistency = c()
+for(i in 1:n){
+  xy_consistency = c(xy_consistency,nMale(ditree[[i]]))
+}
+#Some windows fail to produce trees, so read in a table that contains the start point of each tree.
+ranges2 = read.table("ranges.txt")
+#And you can see the consistency - 
+plot(ranges2,ret)
+
+
+```
+
+
+## Fst randomizations and qvalues
+
+Finally, we have the code to perform XY randomizations and permutations. This code
+
+```{r Fst randomizations}
+
+#We randomize across the entire focal region, but we will be excluding windows that have too few SNPs in downstream analyses.
+
+permutations = 100000
+
+#Settle in - this takes a long while. Marginally faster solution can be done with apply/doSNOW/parallel, but this was easiest to debug.
+
+r_fst3 = matrix(ncol=400,nrow=permutations)
+posRange = 7500000:11500000
+idx = which(pos %in% posRange)
+wnd = 10000
+start = min(posRange)+1
+wnds = (max(posRange)-min(posRange))/wnd
+wndids = sapply(0:(wnds-1),function(x) which(pos[idx] %in% ((wnd*x+start):(wnd*x+start+wnd))))
+for(i in 1:permutations){
+  rsons = sample(1:30,15,replace=FALSE)
+  rdaughters = setdiff(1:30,rsons)
+  rhapsY = hapsT[idx,rsons]
+  rhapsX = hapsT[idx,rdaughters]
+  rmiss_X = apply(rhapsX,1,function(x) length(which(!is.finite(x))))
+  rmiss_Y= apply(rhapsY,1,function(x) length(which(!is.finite(x))))
+  rp_y= apply(rhapsY,1,mean,na.rm=TRUE)
+  rp_x= apply(rhapsX,1,mean,na.rm=TRUE)
+  rpi_y = 2*rp_y*(1-rp_y)*(dim(rhapsY)[2]-rmiss_Y)/(dim(rhapsY)[2]-rmiss_Y-1)
+  rpi_x = 2*rp_x*(1-rp_x)*(dim(rhapsX)[2]-rmiss_X)/(dim(rhapsX)[2]-rmiss_X-1)
+  Rfst = 1-((dim(rhapsX)[2]-rmiss_X)/(30-rmiss_X-rmiss_Y)*rpi_x+(dim(rhapsY)[2]-rmiss_Y)/(30-rmiss_X-rmiss_Y)*rpi_y)/pi_t[idx]
+  Rfst[which(Rfst<0)] = 0
+  test = unlist(lapply(wndids,function(x) {
+    if(length(x)>1){
+      mean(Rfst[x],na.rm=TRUE)
+    } else {
+      return(NA)
+    }
+  }))
+  r_fst3[i,] = test
+}
+
+#Now we can calculate the quantiles as well as q-values.
+
+#Range of window ids to test
+to_test = which(chr_tot$pos %in% (posRange+20620000))[-401]
+#Filter out windows with too few SNPs (dt is total snp density)
+idx2 = which(chr_tot$dt[to_test]>10)
+#Calculate the quantile of each observed Fst vs randomization
+quants = sapply(1:400,function(x) length(which(r_fst3[,x] >chr_tot$fst[to_test][x])))/permutations
+#And finally calculate qvalues. pi0=1 is optional, but used to be consistent with how we tested simulated data.
+qvals= qvalue(quants[idx2],pfdr=FALSE,pi0=1)
+
+#We can next replicate Figure 3.
+
+melt_fst = melt(r_fst)
+
+ggplot()+geom_hex(data=melt_fst,aes(x=Var1,y=value))+
+  geom_point(data=chr_tot[to_test[idx2],],aes(x=pos,y=fst))+
+  scale_fill_gradient(low="white",high="black",trans="log10")
+
+```
